@@ -2,6 +2,7 @@ module futurebox::futurebox {
     use sui::event;
     use std::string::{Self, String, to_ascii};
     use sui::display::{Self, update_version};
+    use sui::table::{Self, Table};
     use sui::table_vec::{Self, TableVec};
     use sui::url::{Url, new_unsafe};
 
@@ -14,15 +15,22 @@ module futurebox::futurebox {
     const SMALL_BATCH_THRESHOLD: u64 = 10;
     // 批次大小
     const BATCH_SIZE: u64 = 30;
+    // 每个用户最多投5票
+    const MAX_VOTES_PER_USER: u64 = 5;
 
     //错误码定义
     const ERR_INVALID_CONTENT: u64 = 1;
     const ERR_POOL_IS_NOT_OPEN: u64 = 2;
     const ERR_POOL_IS_NOT_LOCK: u64 = 3;
     const ERR_POOL_IS_EMPTY: u64 = 4;
-    const ERR_POOL_NOT_EMPTY: u64 = 5;
-    const ERR_POOL_IS_NOT_UNLOCK: u64 = 6;
-    const ERROR_NO_BOX_FOUND: u64 = 7;
+    const ERR_POOL_IS_NOT_UNLOCK: u64 = 5;
+    const ERROR_NO_BOX_FOUND: u64 = 6;
+    const ERR_ALREADY_VOTED: u64 = 7;
+    const ERR_INVALID_BOX_ID: u64 = 8;
+    const ERR_VOTE_SELF: u64 = 9;
+    const ERR_NOT_POOL_PARTICIPANT: u64 = 10;
+    const ERR_TOO_MANY_VOTES: u64 = 11;
+
 
     public struct FUTUREBOX has drop {}
 
@@ -37,11 +45,11 @@ module futurebox::futurebox {
     public struct FutureBox has key, store {
         id: UID,
         name: String,
-        description: String,
         content_type: BoxContentType,
         text_content: Option<String>,
         image_url: Option<Url>,
-        owner_address: address
+        owner_address: address,
+        votes_num: u64
     }
 
     // Box的管理者结构体
@@ -81,7 +89,9 @@ module futurebox::futurebox {
         num_boxes: u64,
         staus: PoolStatus,
         address_list: vector<address>,
-        description: String
+        description: String,
+        voted_records: Table<address, vector<ID>>,// 记录每个地址的投票情况
+        box_indices: Table<ID, u64>// 记录每个Box在池子中的索引
     }
 
     //池子状态常量定义
@@ -103,7 +113,9 @@ module futurebox::futurebox {
             num_boxes: 0,
             staus: PoolStatus::Open,
             address_list: vector::empty<address>(),
-            description
+            description,
+            voted_records: table::new(ctx),
+            box_indices: table::new(ctx)
         };
 
         transfer::share_object(box_pool);
@@ -112,7 +124,6 @@ module futurebox::futurebox {
     // 创建一个新的 single_box
     entry fun create_single_box(
         name: String,
-        description: String,
         content_type: u8,
         content: String,
         ctx: &mut TxContext,
@@ -125,17 +136,16 @@ module futurebox::futurebox {
             let future_box = FutureBox {
                 id: object::new(ctx),
                 name,
-                description,
                 content_type: BoxContentType::Text,
                 text_content: option::some<String>(content),
                 image_url: option::none<Url>(),
-                owner_address: tx_context::sender(ctx)
+                owner_address: tx_context::sender(ctx),
+                votes_num: 0
             };
             // 发布一个创建Text_Box的事件
             let create_text_box_event = CreateSingleBoxEvent {
                 id: object::id(&future_box),
                 name: future_box.name,
-                description: future_box.description,
                 content,
                 owner_address: future_box.owner_address
             };
@@ -147,17 +157,16 @@ module futurebox::futurebox {
             let future_box = FutureBox {
                 id: object::new(ctx),
                 name,
-                description,
                 content_type: BoxContentType::Image,
                 text_content: option::none<String>(),
                 image_url: option::some<Url>(url),
-                owner_address: tx_context::sender(ctx)
+                owner_address: tx_context::sender(ctx),
+                votes_num: 0
             };
             // 发布一个创建Image_Box的事件
             let create_image_box_event = CreateSingleBoxEvent {
                 id: object::id(&future_box),
                 name: future_box.name,
-                description: future_box.description,
                 content,
                 owner_address: future_box.owner_address
             };
@@ -169,7 +178,6 @@ module futurebox::futurebox {
     // 创建一个新的 complete_box
     entry fun create_complete_box(
         name: String,
-        description: String,
         content_type: u8,
         text_content: String,
         image_url: String,
@@ -182,17 +190,16 @@ module futurebox::futurebox {
         let future_box = FutureBox {
             id: object::new(ctx),
             name,
-            description,
             content_type: BoxContentType::TextAndImage,
             text_content: option::some<String>(text_content),
             image_url: option::some<Url>(url),
-            owner_address: tx_context::sender(ctx)
+            owner_address: tx_context::sender(ctx),
+            votes_num: 0
         };
         // 发布一个创建TextAndImage_Box的事件
         let create_text_and_image_box_event = CreateCompleteBoxEvent {
             id: object::id(&future_box),
             name: future_box.name,
-            description: future_box.description,
             text_content,
             image_url,
             owner_address: future_box.owner_address
@@ -205,7 +212,6 @@ module futurebox::futurebox {
     public struct CreateSingleBoxEvent has copy, drop {
         id: ID,
         name: String,
-        description: String,
         content: String,
         owner_address: address
     }
@@ -214,7 +220,6 @@ module futurebox::futurebox {
     public struct CreateCompleteBoxEvent has copy, drop {
         id: ID,
         name: String,
-        description: String,
         text_content: String,
         image_url: String,
         owner_address: address
@@ -239,6 +244,9 @@ module futurebox::futurebox {
         if (!vector::contains(&boxes_pool.address_list, &sender)) {
             vector::push_back(&mut boxes_pool.address_list, sender);
         };
+        // 记录box在数组中的索引位置
+        let index = table_vec::length(&boxes_pool.boxes);
+        table::add(&mut boxes_pool.box_indices, object::id(&box), index);
         // 将Box存入池子中
         table_vec::push_back(&mut boxes_pool.boxes, box);
     }
@@ -272,20 +280,23 @@ module futurebox::futurebox {
         _manager_cap: &ManagerCap,
         boxes_pool: Box_PublicPool
     ) {
-        // 确保池子为空
-        assert!(boxes_pool.num_boxes == 0, ERR_POOL_NOT_EMPTY);
-
         let Box_PublicPool {
             id,
             boxes,
             num_boxes:_,
             staus:_,
             address_list:_,
-            description:_
+            description:_,
+            voted_records,
+            box_indices
         } = boxes_pool;
 
-        // 销毁池子中的所有Box
+        // 安全销毁池子中的所有Box
         table_vec::destroy_empty(boxes);
+        // 销毁投票记录表
+        table::drop(voted_records);
+        // 销毁索引映射表
+        table::drop(box_indices);
         // 销毁池子
         object::delete(id);
     }
@@ -426,10 +437,75 @@ module futurebox::futurebox {
         event::emit(withdraw_box_event);
     }
 
+    // 取回 box 的事件结构
     public struct BoxesWithdrawn has copy, drop {
         boxes_id: vector<ID>,
         count: u64,
         owner_address: address
+    }
+
+    // 添加投票功能
+    entry fun vote_box(
+        box_ids: vector<ID>, // 传入想要投票的 box 的 objectId 数组
+        boxes_pool: &mut Box_PublicPool, // 传入 box 所在的 pool
+        ctx: &TxContext
+    ) {
+        // 检查池子是否为开放状态
+        assert!(boxes_pool.staus == PoolStatus::Open, ERR_POOL_IS_NOT_OPEN);
+        // 获取投票者的地址
+        let voter = tx_context::sender(ctx);
+        // 检查投票者是否在池子中存入过Box
+        assert!(vector::contains(&boxes_pool.address_list, &voter), ERR_NOT_POOL_PARTICIPANT);
+        // 检查投票者是否已经投过票
+        assert!(!table::contains(&boxes_pool.voted_records, voter), ERR_ALREADY_VOTED);
+        // 检查投票者投票数量是否超过最大投票数量
+        assert!(vector::length(&box_ids) <= MAX_VOTES_PER_USER, ERR_TOO_MANY_VOTES);
+        // 创建投票记录
+        let mut voted_box_ids = vector::empty<ID>();
+
+        let mut i = 0;
+        let ids_length = vector::length(&box_ids);
+
+        // 遍历投票的 box 的 objectId 数组
+        while (i < ids_length) {
+            let box_id = box_ids[i];
+            // 检查 box_id 是否有效
+            assert!(table::contains(&boxes_pool.box_indices, box_id), ERR_INVALID_BOX_ID);
+            // 获取 box 在池子中的索引
+            let index = *table::borrow(&boxes_pool.box_indices, box_id);
+            // 获取 box
+            let box = table_vec::borrow_mut(&mut boxes_pool.boxes, index);
+            // 检查是否给自己投票
+            assert!(box.owner_address != voter, ERR_VOTE_SELF);
+            // 检查是否已经在本次投票中投过这个 box
+            if (vector::contains(&voted_box_ids, &box_id)) {
+                abort ERR_ALREADY_VOTED
+            };
+            // 更新 box 的投票数量
+            box.votes_num = box.votes_num + 1;
+            // 记录投票的 box 的 objectId
+            vector::push_back(&mut voted_box_ids, box_id);
+            i = i + 1;
+        };
+        // 记录投票记录
+        table::add(&mut boxes_pool.voted_records, voter, voted_box_ids);
+
+        // 发布一个投票事件
+        let vote_box_event = VoteBoxEvent {
+            voter,
+            box_ids: voted_box_ids,
+            pool_id: object::id(boxes_pool),
+            timestamp: tx_context::epoch(ctx)
+        };
+        event::emit(vote_box_event);
+    }
+
+    // 投票事件结构
+    public struct VoteBoxEvent has copy, drop {
+        voter: address,
+        box_ids: vector<ID>,
+        pool_id: ID,
+        timestamp: u64,
     }
 
     // 只读方法，前端展示
@@ -438,10 +514,6 @@ module futurebox::futurebox {
     // 获取 Box 的名称
     public fun get_box_name(box: &FutureBox): String {
         box.name
-    }
-    // 获取 Box 的描述
-    public fun get_box_description(box: &FutureBox): String {
-        box.description
     }
     // 获取 Box 的内容类型
     public fun get_box_content_type(box: &FutureBox): u8 {
@@ -481,7 +553,10 @@ module futurebox::futurebox {
     public fun get_box_pool_address_list(box_pool: &Box_PublicPool): vector<address> {
         box_pool.address_list
     }
-
+    // 返回对投票记录的引用
+    public fun get_box_pool_voted_records(box_pool: &Box_PublicPool): &Table<address, vector<ID>> {
+        &box_pool.voted_records
+    }
 }
 
 
